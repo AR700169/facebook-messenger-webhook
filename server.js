@@ -1,108 +1,111 @@
+// https://github.com/AR700169/facebook-messenger-webhook/blob/main/server.js
 const express = require('express');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 require('dotenv').config();
+
+// Optional: If you're running Node < 18 install node-fetch:
+// npm install node-fetch
+// const fetch = require('node-fetch');
+const fetch = global.fetch || require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const APP_SECRET = process.env.APP_SECRET;
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Validate required environment variables
+// Minimal env validation
 if (!VERIFY_TOKEN || !APP_SECRET) {
   console.error('❌ CRITICAL: Missing required environment variables (VERIFY_TOKEN, APP_SECRET)');
   process.exit(1);
 }
 
-// Security middleware
-// Limit request body size to prevent DoS attacks
-app.use(express.json({ limit: '1mb' }));
+const CAN_SEND = Boolean(PAGE_ACCESS_TOKEN);
+if (!CAN_SEND) {
+  console.warn('⚠️  PAGE_ACCESS_TOKEN is not configured — send functionality disabled');
+}
 
-// Store raw body for signature verification
-app.use((req, res, next) => {
-  let data = '';
-  req.on('data', (chunk) => {
-    data += chunk;
-  });
-  req.on('end', () => {
-    req.rawBody = data;
-    next();
-  });
-});
+// Security: trust proxy if behind one so rate limiter and IP detection works
+if (process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true') {
+  app.set('trust proxy', 1);
+}
 
-// Rate limiting to prevent abuse
+// Use helmet for common security headers
+app.use(helmet({
+  // Customize if needed
+}));
+
+// Limit request body size and capture raw body for signature verification
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, res, buf) => {
+    // Save raw body for signature verification (exact bytes)
+    req.rawBody = buf;
+  }
+}));
+
+// Rate limiting to prevent abuse (apply after body parsing to allow health checks through)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-
 app.use(limiter);
 
-// Security headers middleware
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  next();
-});
+// Health & readiness endpoints
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+app.get('/ready', (req, res) => res.status(200).json({ status: 'ready' }));
 
 /**
  * GET webhook verification endpoint
- * Facebook sends a GET request to verify the webhook URL
  */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  // Validate all parameters are present
   if (!mode || !token || !challenge) {
     console.warn('⚠️  Webhook verification failed - missing parameters');
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
-  // Verify the token matches using constant-time comparison
   if (mode === 'subscribe' && constantTimeCompare(token, VERIFY_TOKEN)) {
     console.log('✅ Webhook verified successfully');
     return res.status(200).send(challenge);
   }
 
-  // Token mismatch - don't reveal which parameter failed
   console.warn('⚠️  Webhook verification attempted with invalid token');
   return res.status(403).json({ error: 'Forbidden' });
 });
 
 /**
  * POST webhook endpoint
- * Receives messages and events from Facebook Messenger
  */
 app.post('/webhook', (req, res) => {
-  const body = req.body;
-
-  // Verify request signature immediately
+  // Verify request signature immediately using rawBody captured by express.json verify
   if (!verifyRequestSignature(req)) {
     console.error('❌ Request signature verification failed');
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  // Validate object type
+  const body = req.body;
+
   if (body.object !== 'page') {
     console.warn(`⚠️  Invalid webhook object type: ${body.object}`);
     return res.status(400).json({ error: 'Invalid object type' });
   }
 
-  // Validate entry array exists
   if (!Array.isArray(body.entry)) {
     console.warn('⚠️  Invalid entry format in webhook');
     return res.status(400).json({ error: 'Invalid entry format' });
   }
 
-  // Handle webhook events asynchronously
+  // Process asynchronously so we can return 200 quickly
   setImmediate(() => {
     body.entry.forEach((entry) => {
       if (!entry.id || !Array.isArray(entry.messaging)) {
@@ -110,7 +113,6 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
-      // Iterate over each messaging event
       entry.messaging.forEach((messagingEvent) => {
         try {
           if (messagingEvent.message) {
@@ -123,102 +125,78 @@ app.post('/webhook', (req, res) => {
             handleRead(messagingEvent);
           }
         } catch (err) {
-          console.error('❌ Error processing messagingEvent:', err.message);
+          console.error('❌ Error processing messagingEvent:', err && err.stack ? err.stack : err);
         }
       });
     });
   });
 
-  // Return immediately to avoid timeout
+  // Return immediately
   res.status(200).json({ status: 'ok' });
 });
 
 /**
- * Constant-time comparison to prevent timing attacks
- * @param {String} a - First string
- * @param {String} b - Second string
- * @returns {Boolean} - True if strings match
+ * constant-time comparison
  */
 function constantTimeCompare(a, b) {
-  if (!a || !b) return false;
-  
-  const bufferA = Buffer.from(a, 'utf8');
-  const bufferB = Buffer.from(b, 'utf8');
-  
-  if (bufferA.length !== bufferB.length) {
-    return false;
-  }
-  
-  return crypto.timingSafeEqual(bufferA, bufferB);
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
- * Verify the request signature from Facebook
- * Uses SHA256 for better security than SHA1
- * @param {Object} req - Express request object
- * @returns {Boolean} - True if signature is valid
+ * Verify the request signature from Facebook using x-hub-signature-256
  */
 function verifyRequestSignature(req) {
-  const signature = req.get('x-hub-signature-256');
-
-  if (!signature) {
+  const signatureHeader = req.get('x-hub-signature-256');
+  if (!signatureHeader) {
     console.warn('⚠️  Request signature missing');
     return false;
   }
 
-  const elements = signature.split('=');
-  
+  const elements = signatureHeader.split('=');
   if (elements.length !== 2) {
     console.warn('⚠️  Invalid signature format');
     return false;
   }
 
   const [algorithm, signatureHash] = elements;
-
   if (algorithm !== 'sha256') {
     console.warn(`⚠️  Unexpected signature algorithm: ${algorithm}`);
     return false;
   }
 
-  const body = req.rawBody || JSON.stringify(req.body);
-  
   try {
-    const hash = crypto
-      .createHmac('sha256', APP_SECRET)
-      .update(body)
-      .digest('hex');
-
-    return constantTimeCompare(hash, signatureHash);
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body));
+    const hmac = crypto.createHmac('sha256', APP_SECRET);
+    hmac.update(raw);
+    const expected = hmac.digest('hex');
+    return constantTimeCompare(expected, signatureHash);
   } catch (err) {
-    console.error('❌ Error verifying signature:', err.message);
+    console.error('❌ Error verifying signature:', err && err.stack ? err.stack : err);
     return false;
   }
 }
 
 /**
- * Sanitize input to prevent injection attacks
- * @param {String} input - Input string
- * @returns {String} - Sanitized string
+ * sanitize input
  */
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
-  return input
-    .replace(/[<>]/g, '') // Remove angle brackets
-    .substring(0, 1000); // Limit length to 1000 chars
+  return input.replace(/[<>]/g, '').substring(0, 1000);
 }
 
 /**
- * Handle incoming messages
- * @param {Object} event - Messaging event from Facebook
+ * Handlers
  */
 function handleMessage(event) {
   try {
     const senderID = event.sender?.id;
     const recipientID = event.recipient?.id;
-    const timeOfMessage = event.timestamp;
     const message = event.message;
 
-    // Validate required fields
     if (!senderID || !recipientID) {
       console.warn('⚠️  Message missing sender or recipient ID');
       return;
@@ -235,14 +213,10 @@ function handleMessage(event) {
       sendTextMessage(senderID, 'Thanks for sending an attachment!');
     }
   } catch (err) {
-    console.error('❌ Error handling message:', err.message);
+    console.error('❌ Error handling message:', err && err.stack ? err.stack : err);
   }
 }
 
-/**
- * Handle postback from interactive messages
- * @param {Object} event - Postback event from Facebook
- */
 function handlePostback(event) {
   try {
     const senderID = event.sender?.id;
@@ -257,52 +231,38 @@ function handlePostback(event) {
     console.log(`📤 Postback received from user ${senderID}`);
     sendTextMessage(senderID, `Postback: ${sanitizedPayload}`);
   } catch (err) {
-    console.error('❌ Error handling postback:', err.message);
+    console.error('❌ Error handling postback:', err && err.stack ? err.stack : err);
   }
 }
 
-/**
- * Handle delivery confirmation
- * @param {Object} event - Delivery event from Facebook
- */
 function handleDelivery(event) {
   try {
     const senderID = event.sender?.id;
-
     if (!senderID) {
       console.warn('⚠️  Delivery confirmation missing sender ID');
       return;
     }
-
     console.log(`✉️  Delivery confirmation from user ${senderID}`);
   } catch (err) {
-    console.error('❌ Error handling delivery:', err.message);
+    console.error('❌ Error handling delivery:', err && err.stack ? err.stack : err);
   }
 }
 
-/**
- * Handle read receipt
- * @param {Object} event - Read event from Facebook
- */
 function handleRead(event) {
   try {
     const senderID = event.sender?.id;
-
     if (!senderID) {
       console.warn('⚠️  Read receipt missing sender ID');
       return;
     }
-
     console.log(`👁️  Read receipt from user ${senderID}`);
   } catch (err) {
-    console.error('❌ Error handling read receipt:', err.message);
+    console.error('❌ Error handling read receipt:', err && err.stack ? err.stack : err);
   }
 }
 
 /**
- * Send a text message to the user
- * @param {String} recipientID - User's Facebook ID
- * @param {String} messageText - Text to send
+ * Send a text message
  */
 function sendTextMessage(recipientID, messageText) {
   if (!recipientID || !messageText) {
@@ -311,69 +271,74 @@ function sendTextMessage(recipientID, messageText) {
   }
 
   const messageData = {
-    recipient: {
-      id: recipientID,
-    },
-    message: {
-      text: sanitizeInput(messageText),
-    },
+    recipient: { id: recipientID },
+    message: { text: sanitizeInput(messageText) },
   };
 
-  callSendAPI(messageData);
+  callSendAPI(messageData).catch(err => {
+    console.error('❌ sendTextMessage failed:', err && err.stack ? err.stack : err);
+  });
 }
 
 /**
- * Call the Send API with error handling
- * @param {Object} messageData - Message data to send
+ * Call the Send API with retries and improved error handling
  */
-function callSendAPI(messageData) {
-  if (!PAGE_ACCESS_TOKEN) {
-    console.error('❌ PAGE_ACCESS_TOKEN is not configured');
+async function callSendAPI(messageData, attempts = 0) {
+  if (!CAN_SEND) {
+    console.error('❌ PAGE_ACCESS_TOKEN is not configured — cannot send messages');
     return;
   }
 
-  // Use query parameter for token instead of URL parameter
   const url = 'https://graph.facebook.com/v18.0/me/messages';
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${PAGE_ACCESS_TOKEN}`,
+  };
 
-  fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${PAGE_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify(messageData),
-  })
-    .then((res) => {
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
-      }
-      return res.json();
-    })
-    .then((data) => {
-      if (data.message_id) {
-        console.log(`✅ Message sent with ID: ${data.message_id}`);
-      } else if (data.error) {
-        console.error(`❌ API Error: ${data.error.message}`);
-      }
-    })
-    .catch((err) => {
-      console.error('❌ Error calling Send API:', err.message);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(messageData),
     });
+
+    const body = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      // Handle rate limiting & transient errors with exponential backoff
+      const status = res.status;
+      const errMsg = body && body.error ? body.error.message : `HTTP ${status}`;
+      if ((status === 429 || status >= 500) && attempts < 3) {
+        const wait = Math.pow(2, attempts) * 1000;
+        console.warn(`⚠️ Send API returned ${status}. Retrying in ${wait}ms (attempt ${attempts + 1})`);
+        await new Promise(r => setTimeout(r, wait));
+        return callSendAPI(messageData, attempts + 1);
+      }
+      throw new Error(`Send API error: ${errMsg}`);
+    }
+
+    if (body && body.message_id) {
+      console.log(`✅ Message sent with ID: ${body.message_id}`);
+    } else if (body && body.error) {
+      console.error(`❌ API Error: ${body.error.message}`);
+    }
+  } catch (err) {
+    console.error('❌ Error calling Send API:', err && err.stack ? err.stack : err);
+    if (attempts < 3) {
+      const wait = Math.pow(2, attempts) * 1000;
+      await new Promise(r => setTimeout(r, wait));
+      return callSendAPI(messageData, attempts + 1);
+    }
+    throw err;
+  }
 }
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.status(200).json({ status: 'ok', message: 'Facebook Messenger Webhook Server is running' });
-});
-
 // 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not Found' });
-});
+app.use((req, res) => res.status(404).json({ error: 'Not Found' }));
 
-// Error handling middleware
+// Error handling middleware (last)
 app.use((err, req, res, next) => {
-  console.error('❌ Unhandled error:', err.message);
+  console.error('❌ Unhandled error:', err && err.stack ? err.stack : err);
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
@@ -383,19 +348,27 @@ const server = app.listen(PORT, () => {
   console.log(`📍 Webhook endpoint: http://localhost:${PORT}/webhook\n`);
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
+// Graceful shutdown and global error handling
+function shutdown(code = 0) {
+  console.log('Shutdown initiated');
   server.close(() => {
     console.log('Server closed');
-    process.exit(0);
+    process.exit(code);
   });
-});
+  // Force exit after 10s
+  setTimeout(() => {
+    console.error('Forcing shutdown');
+    process.exit(1);
+  }, 10_000).unref();
+}
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+process.on('SIGTERM', () => shutdown(0));
+process.on('SIGINT', () => shutdown(0));
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err && err.stack ? err.stack : err);
+  shutdown(1);
 });
